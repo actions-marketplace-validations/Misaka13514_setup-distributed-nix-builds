@@ -1,0 +1,265 @@
+name: "Nix Distributed Builder Setup"
+description: "Set up Nix, maximize runner disk space, and connect to Tailscale for distributed building"
+branding:
+  icon: "server"
+  color: "blue"
+inputs:
+  tailscale_authkey:
+    description: "Tailscale OAuth client secret or Auth Key"
+    required: true
+  tailscale_hostname:
+    description: "Hostname to register with Tailscale"
+    required: true
+  tailscale_tags:
+    description: "Tags to advertise to Tailscale (e.g. tag:nix-ci-builder)"
+    required: true
+  role:
+    description: 'Role of the current job: "builder" or "coordinator"'
+    required: true
+    default: "builder"
+  builders:
+    description: "Space separated list of full builder hostnames to wait for. Required if role is coordinator"
+    required: false
+    default: ""
+  builder_timeout:
+    description: "Maximum time (in seconds) the builder should wait before self-terminating"
+    required: false
+    default: "300"
+  extra_nix_config:
+    description: "Extra Nix configuration to append to /etc/nix/nix.conf"
+    required: false
+    default: ""
+runs:
+  using: "composite"
+  steps:
+    - name: Maximize disk space (Nothing but Nix)
+      if: runner.os == 'Linux'
+      uses: wimpysworld/nothing-but-nix@687c797a730352432950c707ab493fcc951818d7
+      with:
+        hatchet-protocol: "cleave"
+
+    - name: Install Nix
+      uses: cachix/install-nix-action@1ca7d21a94afc7c957383a2d217460d980de4934 # v31.10.1
+      with:
+        extra_nix_config: ${{ inputs.extra_nix_config }}
+
+    - name: Setup Magic Nix Cache
+      uses: DeterminateSystems/magic-nix-cache-action@565684385bcd71bad329742eefe8d12f2e765b39 # v13
+      with:
+        use-flakehub: false
+
+    - name: Install and Start Tailscale from nixpkgs
+      shell: bash
+      env:
+        AUTHKEY: ${{ inputs.tailscale_authkey }}
+        HOSTNAME: ${{ inputs.tailscale_hostname }}
+        TAGS: ${{ inputs.tailscale_tags }}
+        TAILSCALE_SSH_DEFAULT_PATH: "/var/root/.nix-profile/bin:/nix/var/nix/profiles/default/bin:/run/current-system/sw/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      run: |
+        nix profile add nixpkgs#tailscale
+        sudo env TAILSCALE_SSH_DEFAULT_PATH="${TAILSCALE_SSH_DEFAULT_PATH}" $(which tailscaled) > /tmp/tailscaled.log 2>&1 &
+        sleep 5
+        sudo $(which tailscale) up \
+          --authkey="${AUTHKEY}?ephemeral=true&preauthorized=true" \
+          --hostname="${HOSTNAME}" \
+          --ssh \
+          --advertise-tags="${TAGS}" \
+          --accept-routes
+
+    - name: Builder - Setup Teardown Script
+      if: ${{ inputs.role == 'builder' }}
+      shell: bash
+      run: |
+        cat << 'EOF' > /tmp/teardown.sh
+        #!/bin/bash
+        echo "Builder: Logging out of Tailscale to clear ephemeral node..."
+        sudo $(which tailscale) logout || true
+        EOF
+        chmod +x /tmp/teardown.sh
+
+    - name: Builder - Register Teardown
+      if: ${{ inputs.role == 'builder' }}
+      uses: gacts/run-and-post-run@81b6ce503cde93862cec047c54652e45c5dca991 # v1.4.3
+      with:
+        post: /tmp/teardown.sh
+
+    - name: Builder - Idle Wait
+      if: ${{ inputs.role == 'builder' }}
+      shell: bash
+      env:
+        BUILDER_TIMEOUT: ${{ inputs.builder_timeout }}
+      run: |
+        echo "Builder is online!"
+        echo "To terminate this builder manually, run:"
+        echo "$ ssh root@${{ inputs.tailscale_hostname }} \"touch /tmp/builder_done\""
+        (
+          while true; do
+            echo "--- System Stats ---"
+            if [ "$(uname)" = "Linux" ]; then
+              top -bn1 | grep "Cpu(s)" | awk '{print "CPU Usage: " $2 + $4 "%"}'
+              free -m | grep Mem | awk '{print "Memory Usage: " $3"/"$2 "MB"}'
+            else
+              top -l 1 | grep -E "^(CPU usage|PhysMem):"
+            fi
+            df -h /nix | tail -1 | awk '{print "Disk Space (/nix): " $3"/"$2 " ("$5")"}'
+            echo "--------------------"
+            sleep 60
+          done
+        ) &
+        STATS_PID=$!
+
+        echo "Waiting for jobs..."
+        START_TIME=$(date +%s)
+        IS_CLAIMED=false
+
+        while true; do
+          CURRENT_TIME=$(date +%s)
+          ELAPSED=$((CURRENT_TIME - START_TIME))
+
+          if [ "$IS_CLAIMED" = false ] && [ -f "/tmp/builder_claimed" ]; then
+            echo "Builder has been claimed! Extending timeout to 6 hours."
+            IS_CLAIMED=true
+            BUILDER_TIMEOUT=21600
+            START_TIME=$CURRENT_TIME
+          fi
+
+          if [ $ELAPSED -ge $BUILDER_TIMEOUT ]; then
+            echo "Timeout reached. Shutting down."
+            kill $STATS_PID 2>/dev/null || true
+            exit 1
+          fi
+
+          if [ -f "/tmp/builder_done" ]; then
+            echo "Received termination successful signal! Shutting down gracefully."
+            kill $STATS_PID 2>/dev/null || true
+            exit 0
+          fi
+          sleep 10
+        done
+
+    - name: Coordinator - Setup Teardown Script
+      if: ${{ inputs.role == 'coordinator' }}
+      shell: bash
+      env:
+        INPUT_BUILDERS: ${{ inputs.builders }}
+      run: |
+        echo "#!/bin/bash" > /tmp/teardown.sh
+        echo "BUILDERS=\"${INPUT_BUILDERS}\"" >> /tmp/teardown.sh
+
+        cat << 'EOF' >> /tmp/teardown.sh
+        echo "Coordinator: Tearing down builders gracefully..."
+
+        for hostname in $BUILDERS; do
+          echo "Initiating teardown for $hostname..."
+          SUCCESS=false
+
+          for i in {1..5}; do
+            if sudo ssh -o ConnectTimeout=10 root@$hostname "touch /tmp/builder_done"; then
+              echo "Successfully sent teardown signal to $hostname."
+              SUCCESS=true
+              break
+            else
+              echo "Attempt $i failed to signal $hostname. Retrying in 3 seconds..."
+              sleep 3
+            fi
+          done
+
+          if [ "$SUCCESS" = false ]; then
+            echo "ERROR: Failed to teardown $hostname after 5 attempts. It will eventually hit the fallback timeout."
+          fi
+        done
+
+        echo "Coordinator: Logging out of Tailscale..."
+        sudo $(which tailscale) logout || true
+        EOF
+        chmod +x /tmp/teardown.sh
+
+    - name: Coordinator - Register Teardown
+      if: ${{ inputs.role == 'coordinator' }}
+      uses: gacts/run-and-post-run@81b6ce503cde93862cec047c54652e45c5dca991 # v1.4.3
+      with:
+        post: /tmp/teardown.sh
+
+    - name: Coordinator - Wait for builders and Setup
+      if: ${{ inputs.role == 'coordinator' }}
+      env:
+        INPUT_BUILDERS: ${{ inputs.builders }}
+        BUILDER_TIMEOUT: ${{ inputs.builder_timeout }}
+      shell: bash
+      run: |
+        # 1. Wait for all builders
+        for hostname in $INPUT_BUILDERS; do
+          echo "Waiting for $hostname to appear on Tailscale network..."
+          TIMEOUT=$((BUILDER_TIMEOUT + 60))
+          TIMER=0
+
+          while true; do
+            TS_IP=$(sudo $(which tailscale) status | grep -w "$hostname" | awk '{print $1}' | grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}' | head -n 1 || true)
+            if [ -n "$TS_IP" ]; then
+              echo "Resolved IP $TS_IP from Tailscale status for $hostname!"
+              echo "$TS_IP $hostname" | sudo tee -a /etc/hosts
+              break
+            fi
+
+            if [ $TIMER -ge $TIMEOUT ]; then
+              echo "Timeout waiting for $hostname."
+              exit 1
+            fi
+            sleep 5
+            TIMER=$((TIMER+5))
+            echo "Waiting for $hostname... ($TIMER/$TIMEOUT s)"
+          done
+
+          echo "Checking connectivity to $hostname..."
+          until ping -c 1 -W 1 "$hostname" >/dev/null 2>&1; do
+            if [ $TIMER -ge $TIMEOUT ]; then
+              echo "Timeout checking connectivity to $hostname."
+              exit 1
+            fi
+            sleep 2
+            TIMER=$((TIMER+2))
+          done
+          echo "$hostname is online and reachable!"
+        done
+
+        # 2. Setup Remote Builder in Nix
+        for hostname in $INPUT_BUILDERS; do
+          echo -e "Host $hostname\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n  BatchMode yes\n  LogLevel ERROR" | sudo tee -a /etc/ssh/ssh_config
+        done
+
+        for hostname in $INPUT_BUILDERS; do
+          echo "Testing Nix connection to $hostname..."
+
+          SYS_INFO=$(sudo ssh root@$hostname "nix eval --raw --impure --expr 'builtins.currentSystem' && echo -n ' ' && (nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)")
+          SYSTEM=$(echo "$SYS_INFO" | awk '{print $1}')
+          CORES=$(echo "$SYS_INFO" | awk '{print $2}')
+
+          if [ -z "$SYSTEM" ]; then
+            echo "ERROR: Failed to query Nix system on $hostname!"
+            exit 1
+          fi
+
+          echo "Claiming builder $hostname ($SYSTEM with $CORES cores)..."
+          sudo ssh root@$hostname "touch /tmp/builder_claimed" || true
+
+          if [[ "$SYSTEM" == *"linux"* ]]; then
+            FEATURES="kvm,nixos-test,big-parallel,benchmark"
+          else
+            FEATURES="big-parallel,benchmark"
+          fi
+
+          OPT_CORES=$((CORES * 2))
+
+          echo "ssh-ng://root@$hostname $SYSTEM - $OPT_CORES 1 $FEATURES" | sudo tee -a /etc/nix/machines
+        done
+
+        echo "builders = @/etc/nix/machines" | sudo tee -a /etc/nix/nix.conf
+        echo "builders-use-substitutes = true" | sudo tee -a /etc/nix/nix.conf
+
+        if [ "$(uname)" = "Darwin" ]; then
+          sudo launchctl stop org.nixos.nix-daemon || true
+          sudo launchctl start org.nixos.nix-daemon || true
+        else
+          sudo pkill nix-daemon || true
+          sudo systemctl restart nix-daemon.service || true
+        fi

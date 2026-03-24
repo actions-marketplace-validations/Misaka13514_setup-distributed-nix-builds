@@ -1,0 +1,44 @@
+name: Standalone Nix & Tailscale Test Node
+
+on:
+  workflow_dispatch:
+    inputs:
+      os:
+        description: "Runner OS"
+        required: true
+        default: "ubuntu-latest"
+        type: choice
+        options:
+          - ubuntu-latest
+          - ubuntu-24.04
+          - ubuntu-22.04
+          - ubuntu-24.04-arm
+          - ubuntu-22.04-arm
+          - macos-26-intel
+          - macos-15-intel
+          - macos-latest
+          - macos-26
+          - macos-15
+          - macos-14
+      timeout:
+        description: "Builder self-terminate timeout in seconds"
+        required: true
+        default: "1800"
+        type: string
+
+jobs:
+  test-node:
+    name: Standalone Node (${{ inputs.os }})
+    runs-on: ${{ inputs.os }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Start Standalone Builder Node
+        uses: ./
+        with:
+          tailscale_authkey: ${{ secrets.TS_OAUTH_SECRET }}
+          tailscale_hostname: nix-test-${{ inputs.os }}-${{ github.run_id }}
+          tailscale_tags: tag:nix-ci-builder
+          role: builder
+          builder_timeout: ${{ inputs.timeout }}

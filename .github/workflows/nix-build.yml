@@ -1,0 +1,154 @@
+name: Distributed Nix Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      debug_sleep_duration:
+        description: 'Sleep duration (in seconds) at the end for manual SSH debugging (0 to disable)'
+        required: false
+        type: number
+        default: 0
+
+env:
+  BUILDER_COUNTS: '{"ubuntu-24.04": 1, "ubuntu-24.04-arm": 1, "macos-26-intel": 1, "macos-26": 1}'
+  EXTRA_NIX_CONFIG: |
+    download-attempts = 10
+    trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY= nix-community.cachix.org-1:mB9FSh9qf2dCimDSUo8Zy7bkq5CX+/rkCWyvRCYg3Fs= cache.nixos-cuda.org:74DUi4Ye579gUqzH4ziL9IyiJBlDpMRn9MBN8oNan9M=
+    extra-substituters = https://nix-community.cachix.org https://cache.nixos-cuda.org
+
+jobs:
+  config:
+    runs-on: ubuntu-slim
+    outputs:
+      builder_matrix: ${{ steps.set.outputs.builder_matrix }}
+      builders_list: ${{ steps.set.outputs.builders_list }}
+      run_suffix: ${{ steps.set.outputs.run_suffix }}
+    steps:
+      - id: set
+        run: |
+          SUFFIX=$(openssl rand -hex 3)
+          echo "run_suffix=$SUFFIX" >> "$GITHUB_OUTPUT"
+
+          MATRIX_JSON=$(echo '${{ env.BUILDER_COUNTS }}' | jq -c '[
+              to_entries[] | .key as $os | .value as $count |
+              range(1; $count + 1) | { os: $os, id: "\($os)-\(.)" }
+            ]
+          ')
+          echo "builder_matrix=$MATRIX_JSON" >> "$GITHUB_OUTPUT"
+
+          BUILDERS_LIST=$(echo "$MATRIX_JSON" | jq -r --arg suffix "$SUFFIX" 'map("nix-builder-\($suffix)-\(.id)") | join(" ")')
+          echo "builders_list=$BUILDERS_LIST" >> "$GITHUB_OUTPUT"
+
+  builder:
+    needs: config
+    name: Builder ${{ matrix.builder.id }} (${{ needs.config.outputs.run_suffix }})
+    runs-on: ${{ matrix.builder.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        builder: ${{ fromJSON(needs.config.outputs.builder_matrix) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+      - name: Setup Nix & Tailscale
+        uses: ./
+        with:
+          tailscale_authkey: ${{ secrets.TS_OAUTH_SECRET }}
+          tailscale_hostname: nix-builder-${{ needs.config.outputs.run_suffix }}-${{ matrix.builder.id }}
+          tailscale_tags: tag:nix-ci-builder
+          role: builder
+          extra_nix_config: ${{ env.EXTRA_NIX_CONFIG }}
+
+  coordinator:
+    needs: config
+    name: Coordinator (${{ needs.config.outputs.run_suffix }})
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+      - name: Setup Nix & Tailscale
+        uses: ./
+        with:
+          tailscale_authkey: ${{ secrets.TS_OAUTH_SECRET }}
+          tailscale_hostname: nix-coordinator-${{ needs.config.outputs.run_suffix }}
+          tailscale_tags: tag:nix-ci-coordinator
+          role: coordinator
+          builders: ${{ needs.config.outputs.builders_list }}
+          extra_nix_config: ${{ env.EXTRA_NIX_CONFIG }}
+
+      - name: Executing distributed builds
+        env:
+          RUN_SUFFIX: ${{ needs.config.outputs.run_suffix }}
+        run: |
+          cat << 'EOF' > test-build.nix
+          let
+            nixpkgs = (builtins.getFlake "nixpkgs").legacyPackages;
+            runSuffix = builtins.getEnv "RUN_SUFFIX";
+
+            systems =[ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
+
+            buildFor = system:
+              let pkgs = nixpkgs.${system}; in
+              pkgs.runCommand "builder-env-info-${system}-${runSuffix}" {
+                inherit runSuffix;
+              } ''
+                mkdir -p $out
+                INFO_FILE=$out/info.txt
+
+                echo "=== Nix Builder Environment Info ===" > $INFO_FILE
+                echo "Target System : ${system}" >> $INFO_FILE
+                echo "Uname         : $(uname -a)" >> $INFO_FILE
+                echo "Date          : $(date)" >> $INFO_FILE
+                echo "Architecture  : $(uname -m)" >> $INFO_FILE
+
+                echo "Build Cores   : $NIX_BUILD_CORES" >> $INFO_FILE
+                if [ "$(uname -s)" = "Darwin" ]; then
+                  MEM_BYTES=$(/usr/sbin/sysctl -n hw.memsize 2>/dev/null || echo 0)
+
+                  echo "CPU Model     : $(/usr/sbin/sysctl -n machdep.cpu.brand_string 2>/dev/null || echo 'Unknown')" >> $INFO_FILE
+                  echo "Total Memory  : $(( MEM_BYTES / 1073741824 )) GB" >> $INFO_FILE
+                elif [ -f /proc/cpuinfo ]; then
+                  CPU_MODEL=$(awk -F: '/^model name/ {print $2; exit}' /proc/cpuinfo | sed 's/^[ \t]*//')
+                  if [ -z "$CPU_MODEL" ]; then
+                    CPU_MODEL=$(awk -F: '/^Hardware/ {print $2; exit}' /proc/cpuinfo | sed 's/^[ \t]*//')
+                  fi
+                  if [ -z "$CPU_MODEL" ]; then
+                    CPU_IMPL=$(awk -F: '/^CPU implementer/ {print $2; exit}' /proc/cpuinfo | sed 's/^[ \t]*//')
+                    CPU_PART=$(awk -F: '/^CPU part/ {print $2; exit}' /proc/cpuinfo | sed 's/^[ \t]*//')
+                    if [ -n "$CPU_PART" ]; then
+                      CPU_MODEL="ARM (Impl: $CPU_IMPL, Part: $CPU_PART)"
+                    fi
+                  fi
+                  [ -z "$CPU_MODEL" ] && CPU_MODEL="Unknown"
+
+                  echo "CPU Model     : $CPU_MODEL" >> $INFO_FILE
+                  echo "Total Memory  : $(awk '/MemTotal/ {printf "%.2f GB", $2/1024/1024}' /proc/meminfo 2>/dev/null || echo 'Unknown')" >> $INFO_FILE
+                fi
+
+                echo "Store Space   : $(df -h /nix/store 2>/dev/null | tail -1 | awk '{print $4 " avail / " $2 " total"}' || echo 'Unknown')" >> $INFO_FILE
+                echo "-----------------------------------" >> $INFO_FILE
+              '';
+          in
+
+          nixpkgs.${builtins.currentSystem}.linkFarm "all-builder-infos-${runSuffix}" (
+            map (sys: { name = "info-${sys}"; path = buildFor sys; }) systems
+          )
+          EOF
+
+          echo "Starting remote multi-arch build..."
+          nix build -L --max-jobs 0 --impure -f test-build.nix
+
+          echo -e "\n\n🚀 Build completed! Checking results from distributed builders:"
+
+          for f in result/info-*/info.txt; do
+            echo -e "\n============================================="
+            echo "📄 Content of $f"
+            echo "============================================="
+            cat "$f"
+          done
+
+      - name: Optional manual SSH debugging sleep
+        if: ${{ inputs.debug_sleep_duration > 0 }}
+        run: |
+          echo "Sleeping for ${{ inputs.debug_sleep_duration }} seconds for SSH debugging..."
+          sleep ${{ inputs.debug_sleep_duration }}
